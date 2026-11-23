@@ -1,0 +1,329 @@
+import json
+import os
+import time
+from pathlib import Path
+
+import pandas as pd
+import pandas_market_calendars as mcal
+import requests
+import yfinance as yf
+
+
+STATE_FILE = Path("state.json")
+WATCHLIST_FILE = Path("watchlist.txt")
+
+MARKET_SYMBOL = "SPY"
+
+FAST_EMA = 9
+SLOW_EMA = 21
+
+CANDLE_MINUTES = 5
+MAX_DATA_AGE_MINUTES = 20
+
+BULLISH = "BULLISH (Call bias)"
+BEARISH = "BEARISH (Put bias)"
+NEUTRAL = "NEUTRAL (no clear trend)"
+
+
+def send_discord(message):
+    """Send one message without allowing mentions."""
+
+    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL")
+
+    if not webhook_url:
+        raise RuntimeError(
+            "Missing DISCORD_WEBHOOK_URL repository secret."
+        )
+
+    for attempt in range(3):
+        response = requests.post(
+            webhook_url,
+            params={"wait": "true"},
+            json={
+                "content": message,
+                "allowed_mentions": {"parse": []},
+            },
+            timeout=30,
+        )
+
+        if response.status_code == 429 and attempt < 2:
+            retry_after = float(
+                response.json().get("retry_after", 5)
+            )
+            time.sleep(min(retry_after, 60))
+            continue
+
+        if not response.ok:
+            # Do not log the webhook URL or response request.
+            raise RuntimeError(
+                f"Discord returned HTTP {response.status_code}."
+            )
+
+        return
+
+
+def load_watchlist():
+    """Load symbols and always include the market reference."""
+
+    if not WATCHLIST_FILE.exists():
+        raise RuntimeError("watchlist.txt was not found.")
+
+    symbols = [MARKET_SYMBOL]
+
+    for line in WATCHLIST_FILE.read_text().splitlines():
+        symbol = line.split("#", 1)[0].strip().upper()
+
+        if symbol:
+            symbols.append(symbol)
+
+    return list(dict.fromkeys(symbols))
+
+
+def load_state():
+    """Load the labels already sent to Discord."""
+
+    if not STATE_FILE.exists():
+        return {}
+
+    return json.loads(STATE_FILE.read_text())
+
+
+def save_state(state):
+    """Save alert memory locally for the workflow to commit."""
+
+    STATE_FILE.write_text(
+        json.dumps(state, indent=2) + "\n"
+    )
+
+
+def market_is_open(now):
+    """Check the NYSE regular trading session."""
+
+    trading_date = now.tz_convert(
+        "America/New_York"
+    ).date()
+
+    schedule = mcal.get_calendar("NYSE").schedule(
+        start_date=trading_date,
+        end_date=trading_date,
+    )
+
+    if schedule.empty:
+        return False
+
+    session = schedule.iloc[0]
+
+    return session["market_open"] <= now < session["market_close"]
+
+
+def get_reading(symbol, now):
+    """Calculate a trend using completed five-minute candles."""
+
+    data = yf.download(
+        symbol,
+        period="5d",
+        interval="5m",
+        prepost=False,
+        auto_adjust=True,
+        progress=False,
+        threads=False,
+        multi_level_index=False,
+        timeout=25,
+    )
+
+    if data is None or data.empty:
+        raise ValueError("No price data returned.")
+
+    data.index = pd.to_datetime(data.index, utc=True)
+
+    # Exclude the candle that is still forming.
+    completed = (
+        data.index
+        + pd.Timedelta(minutes=CANDLE_MINUTES)
+        <= now
+    )
+
+    data = data.loc[completed]
+    close = data["Close"].dropna()
+
+    if len(close) < 50:
+        raise ValueError("Not enough completed candles.")
+
+    candle_end = (
+        close.index[-1]
+        + pd.Timedelta(minutes=CANDLE_MINUTES)
+    )
+
+    data_age = now - candle_end
+
+    if data_age > pd.Timedelta(
+        minutes=MAX_DATA_AGE_MINUTES
+    ):
+        raise ValueError("Latest price data is too old.")
+
+    ema_fast = close.ewm(
+        span=FAST_EMA,
+        adjust=False,
+    ).mean()
+
+    ema_slow = close.ewm(
+        span=SLOW_EMA,
+        adjust=False,
+    ).mean()
+
+    price = float(close.iloc[-1])
+    fast_now = float(ema_fast.iloc[-1])
+    fast_previous = float(ema_fast.iloc[-2])
+    slow_now = float(ema_slow.iloc[-1])
+
+    bullish = (
+        price > fast_now > slow_now
+        and fast_now > fast_previous
+    )
+
+    bearish = (
+        price < fast_now < slow_now
+        and fast_now < fast_previous
+    )
+
+    if bullish:
+        label = BULLISH
+    elif bearish:
+        label = BEARISH
+    else:
+        label = NEUTRAL
+
+    return {
+        "label": label,
+        "price": price,
+        "ema_fast": fast_now,
+        "ema_slow": slow_now,
+        "candle_end": candle_end,
+    }
+
+
+def build_message(symbol, reading, market_reading):
+    """Format a Discord alert."""
+
+    if market_reading:
+        market_line = (
+            f"Market reference {MARKET_SYMBOL}: "
+            f"{market_reading['label']} | "
+            f"${market_reading['price']:.2f}"
+        )
+    else:
+        market_line = (
+            f"Market reference {MARKET_SYMBOL}: unavailable"
+        )
+
+    candle_time = reading["candle_end"].tz_convert(
+        "America/New_York"
+    ).strftime("%Y-%m-%d %I:%M %p %Z")
+
+    return (
+        "WATCHLIST TREND ALERT\n"
+        f"{market_line}\n\n"
+        f"{symbol}: {reading['label']}\n"
+        f"Price: ${reading['price']:.2f}\n"
+        f"EMA {FAST_EMA}: ${reading['ema_fast']:.2f}\n"
+        f"EMA {SLOW_EMA}: ${reading['ema_slow']:.2f}\n"
+        f"Completed candle ends: {candle_time}\n\n"
+        "Timeframe: completed 5-minute candles.\n"
+        "Trend only; not an options entry signal "
+        "or profit guarantee."
+    )
+
+
+def main():
+    now = pd.Timestamp.now(tz="UTC")
+
+    if not market_is_open(now):
+        print(
+            "US regular trading session is closed. "
+            "No alerts sent."
+        )
+        return
+
+    symbols = load_watchlist()
+    old_state = load_state()
+    new_state = dict(old_state)
+
+    readings = {}
+    skipped = []
+
+    for symbol in symbols:
+        try:
+            readings[symbol] = get_reading(symbol, now)
+        except Exception as error:
+            skipped.append(symbol)
+            print(
+                f"Skipped {symbol}: "
+                f"{type(error).__name__}"
+            )
+
+    if skipped:
+        print(
+            "::warning::Skipped symbols: "
+            + ", ".join(skipped)
+        )
+
+    if not readings:
+        raise RuntimeError(
+            "No fresh readings available. "
+            "Check symbols and data-provider availability."
+        )
+
+    force_report = (
+        os.environ.get("FORCE_REPORT", "false").lower()
+        == "true"
+    )
+
+    trading_date = str(
+        now.tz_convert("America/New_York").date()
+    )
+
+    market_reading = readings.get(MARKET_SYMBOL)
+
+    alerts_sent = 0
+
+    for symbol, reading in readings.items():
+        previous = old_state.get(symbol, {})
+
+        label_changed = (
+            previous.get("label") != reading["label"]
+        )
+
+        first_reading_today = (
+            previous.get("date") != trading_date
+        )
+
+        if (
+            force_report
+            or label_changed
+            or first_reading_today
+        ):
+            message = build_message(
+                symbol,
+                reading,
+                market_reading,
+            )
+
+            send_discord(message)
+
+            new_state[symbol] = {
+                "label": reading["label"],
+                "date": trading_date,
+            }
+
+            # Preserve progress after each successful send.
+            save_state(new_state)
+            alerts_sent += 1
+
+    print(
+        f"Checked {len(readings)} symbols. "
+        f"Sent {alerts_sent} alerts."
+    )
+
+
+if __name__ == "__main__":
+    main()
